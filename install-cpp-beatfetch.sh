@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
+if grep -q "^ID=kali" /etc/os-release 2>/dev/null; then
+
+echo -e "${RED}Nice try script kiddie. Kali is not a daily driver, and ricing it is a federal offense to common sense.${RESET}"
+
+exit 1
+
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="$SCRIPT_DIR/Beatfetch_C/beatfetch-cpp-latest"
+
 
 BOLD='\033[1m'
 DIM='\033[2m'
