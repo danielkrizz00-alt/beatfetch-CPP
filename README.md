@@ -2,7 +2,6 @@
 
 A live terminal dashboard, ported from the original Python/rich prototype to a compact C++ implementation.
 
-This folder is the latest packaged C++ release and is suitable for tar.gz distribution.
 
 ## Requirements
 
