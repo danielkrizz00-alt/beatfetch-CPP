@@ -1,455 +1,671 @@
-#!/usr/bin/env bash
-set -euo pipefail
+// BeatFetch (C++) — live terminal dashboard combining:
+//   - fastfetch system info (auto-refreshing)
+//   - currently playing music (via playerctl / MPRIS)
+//   - a real-time audio spectrum visualizer (via cava)
+//
+// Requires: fastfetch (or hyfetch/neofetch), playerctl, cava.
+// Build: make (see Makefile). Run: ./beatfetch
 
-# ============================================================
-# BeatFetch (C++) — all-in-one installer / uninstaller
-#
-# Fetches the source directly from GitHub (no need to have the
-# repo checked out locally first), builds it, and installs it.
-# Also handles removal via --uninstall.
-#
-#   Repo: https://github.com/danielkrizz00-alt/beatfetch-CPP
-# ============================================================
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <sys/ioctl.h>
+#include <sys/wait.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
 
-REPO_URL="https://github.com/danielkrizz00-alt/beatfetch-CPP.git"
-REPO_TARBALL_BASE="https://codeload.github.com/danielkrizz00-alt/beatfetch-CPP/tar.gz/refs/heads"
-BRANCH="main"
-
-SRC_DIR="$HOME/.local/share/beatfetch-cpp/src"
-BIN_PATH="$HOME/.local/bin/beatfetch"
-PATH_MARKER="# Added by BeatFetch C++ installer"
-PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
-
-BOLD='\033[1m'
-DIM='\033[2m'
-GREEN='\033[32m'
-CYAN='\033[36m'
-YELLOW='\033[33m'
-RED='\033[31m'
-RESET='\033[0m'
-
-USE_ZENITY=0
-FORCE_MODE=""
-ACTION="install"
-LOG_FILE="$(mktemp /tmp/beatfetch-installer.XXXXXX.log)"
-SUDO_KEEPALIVE_PID=""
-STATUS_LOG=()
-
-usage() {
-  cat <<EOF
-Usage: $(basename "$0") [--install|--uninstall] [--gui|--no-gui] [--branch <name>] [-h|--help]
-
-  --install    Fetch, build, and install BeatFetch (default).
-  --uninstall  Remove an installed BeatFetch.
-  --gui        Force the zenity-based graphical UI (requires a display).
-  --no-gui     Force the plain terminal UI, even in a graphical session.
-  --branch     Git branch/ref to fetch (default: main).
-  -h, --help   Show this help text.
-EOF
+static std::vector<std::string> splitLines(const std::string &s) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : s) {
+        if (c == '\n') { out.push_back(cur); cur.clear(); }
+        else cur.push_back(c);
+    }
+    out.push_back(cur);
+    return out;
 }
 
-parse_args() {
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --install) ACTION="install" ;;
-      --uninstall) ACTION="uninstall" ;;
-      --gui) FORCE_MODE="gui" ;;
-      --no-gui|--cli) FORCE_MODE="cli" ;;
-      --branch) BRANCH="${2:-main}"; shift ;;
-      -h|--help) usage; exit 0 ;;
-      *) echo -e "${RED}Unknown option: $1${RESET}"; usage; exit 1 ;;
-    esac
-    shift
-  done
+static std::vector<std::string> splitChar(const std::string &s, char sep) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : s) {
+        if (c == sep) { out.push_back(cur); cur.clear(); }
+        else cur.push_back(c);
+    }
+    out.push_back(cur);
+    return out;
 }
 
-ui_banner() {
-  clear
-  local title="BeatFetch C++ Installer"
-  [ "$ACTION" = "uninstall" ] && title="BeatFetch C++ Uninstaller"
-  echo -e "${BOLD}${CYAN}========================================${RESET}"
-  printf "${BOLD}%*s${RESET}\n" $(( (40 + ${#title}) / 2 )) "$title"
-  echo -e "${BOLD}${CYAN}========================================${RESET}"
-  echo
+static std::string trim(const std::string &s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
 }
 
-has_display() {
-  [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]
+static std::pair<int, std::string> execCapture(const std::vector<std::string> &args,
+                                                int timeoutSec = 10) {
+    int outPipe[2];
+    if (pipe(outPipe) != 0) return {-1, ""};
+
+    pid_t pid = fork();
+    if (pid < 0) return {-1, ""};
+
+    if (pid == 0) {
+        dup2(outPipe[1], STDOUT_FILENO);
+        dup2(outPipe[1], STDERR_FILENO);
+        close(outPipe[0]);
+        close(outPipe[1]);
+        std::vector<char *> argv;
+        for (auto &a : args) argv.push_back(const_cast<char *>(a.c_str()));
+        argv.push_back(nullptr);
+        execvp(argv[0], argv.data());
+        _exit(127);
+    }
+
+    close(outPipe[1]);
+    std::string output;
+    char buf[4096];
+    fcntl(outPipe[0], F_SETFL, O_NONBLOCK);
+    auto start = std::chrono::steady_clock::now();
+    int status = -1;
+    bool exited = false;
+    while (true) {
+        ssize_t n = read(outPipe[0], buf, sizeof(buf));
+        if (n > 0) {
+            output.append(buf, n);
+            continue;
+        }
+        if (!exited) {
+            pid_t r = waitpid(pid, &status, WNOHANG);
+            if (r == pid) exited = true;
+        }
+        if (n == 0 && exited) break;
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+        if (elapsed > timeoutSec) {
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    close(outPipe[0]);
+    int rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    return {rc, output};
 }
 
-ensure_zenity() {
-  has_display || return 1
-
-  if command -v zenity >/dev/null 2>&1; then
-    return 0
-  fi
-
-  # Only offer to install zenity when doing a fresh install; uninstall
-  # shouldn't need sudo or a package install of its own.
-  [ "$ACTION" = "uninstall" ] && return 1
-
-  echo -e "${DIM}Graphical session detected but zenity isn't installed. Installing it...${RESET}"
-  if command -v apt-get >/dev/null 2>&1; then
-    sudo apt-get update && sudo apt-get install -y zenity
-  elif command -v dnf >/dev/null 2>&1; then
-    sudo dnf install -y zenity
-  elif command -v pacman >/dev/null 2>&1; then
-    sudo pacman -Sy --noconfirm zenity
-  elif command -v zypper >/dev/null 2>&1; then
-    sudo zypper install -y zenity
-  fi
-
-  command -v zenity >/dev/null 2>&1
+static bool commandExists(const std::string &name) {
+    std::string path = getenv("PATH") ? getenv("PATH") : "";
+    std::stringstream ss(path);
+    std::string dir;
+    while (std::getline(ss, dir, ':')) {
+        std::string p = dir + "/" + name;
+        if (access(p.c_str(), X_OK) == 0) return true;
+    }
+    return false;
 }
 
-setup_mode() {
-  case "$FORCE_MODE" in
-    gui)
-      if ensure_zenity; then
-        USE_ZENITY=1
-      else
-        echo -e "${YELLOW}zenity isn't available (no display, or install failed); falling back to terminal prompts.${RESET}"
-        USE_ZENITY=0
-      fi
-      ;;
-    cli)
-      USE_ZENITY=0
-      ;;
-    *)
-      if ensure_zenity; then
-        USE_ZENITY=1
-        echo -e "${DIM}Graphical session detected — using zenity dialogs. Pass --no-gui to use the terminal instead.${RESET}"
-      else
-        USE_ZENITY=0
-      fi
-      ;;
-  esac
+static bool backendAvailable(const std::string &backend) {
+    if (backend == "hyfetch") {
+        if (!commandExists("python3")) return false;
+        auto [rc, output] = execCapture({"python3", "-m", "hyfetch", "--help"}, 2);
+        return rc == 0 || output.find("hyfetch") != std::string::npos;
+    }
+    return commandExists(backend);
 }
 
-zerror() {
-  echo -e "${RED}$1${RESET}" >&2
-  if [ "$USE_ZENITY" -eq 1 ]; then
-    zenity --error --title="BeatFetch C++ Installer" --text="$1" --width=360 2>/dev/null || true
-  fi
+struct NowPlaying {
+    bool available = false;
+    std::string fatal;
+    std::string status, player, artist, title, album, posStr, lenStr;
+    double ratio = 0.0;
+};
+
+struct AppState {
+    std::mutex mtx;
+    std::vector<std::string> fastfetchLines;
+    std::string fastfetchError;
+    NowPlaying nowPlaying;
+    std::vector<int> bars;
+    std::string cavaError;
+    std::atomic<bool> stop{false};
+    std::atomic<pid_t> cavaPid{-1};
+};
+
+static const char *STATUS_ICON(const std::string &s) {
+    if (s == "Playing") return "\u25B6";
+    if (s == "Paused") return "\u23F8";
+    if (s == "Stopped") return "\u25A0";
+    return "?";
 }
 
-log_status() {
-  STATUS_LOG+=("$1")
+static const int VU_GRADIENT[8][3] = {
+    {0x00, 0xaf, 0x5f}, {0x5f, 0xaf, 0x00}, {0xaf, 0xaf, 0x00}, {0xd7, 0xaf, 0x00},
+    {0xff, 0x87, 0x00}, {0xff, 0x5f, 0x00}, {0xff, 0x2f, 0x00}, {0xff, 0x00, 0x00},
+};
+
+static std::string fg(int r, int g, int b) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "\033[38;2;%d;%d;%dm", r, g, b);
+    return buf;
+}
+static const std::string RESET = "\033[0m";
+static const std::string BOLD = "\033[1m";
+static const std::string ITALIC = "\033[3m";
+static const std::string DIM = "\033[2m";
+
+static std::vector<std::string> buildFetchCommand(const std::string &backend,
+                                                   const std::vector<std::string> &extra) {
+    std::vector<std::string> cmd;
+    if (backend == "hyfetch") {
+        cmd = {"python3", "-m", "hyfetch"};
+    } else if (backend == "neofetch") {
+        cmd = {"neofetch", "--stdout"};
+    } else {
+        cmd = {"fastfetch", "--pipe", "false"};
+    }
+    for (auto &e : extra) cmd.push_back(e);
+    return cmd;
 }
 
-# ---------------- install path ----------------
-
-choose_backend() {
-  if [ "$USE_ZENITY" -eq 1 ]; then
-    local selection
-    selection="$(zenity --list \
-      --title="BeatFetch C++ Installer" \
-      --text="Choose a fetch backend:" \
-      --radiolist --hide-header \
-      --column="Pick" --column="Backend" \
-      TRUE  fastfetch \
-      FALSE hyfetch \
-      FALSE neofetch \
-      --width=360 --height=260)" || { zerror "Installation cancelled."; exit 1; }
-
-    case "$selection" in
-      fastfetch|hyfetch|neofetch) BACKEND="$selection" ;;
-      *) zerror "No backend selected."; exit 1 ;;
-    esac
-    echo -e "${DIM}Backend selected: ${BACKEND}${RESET}"
-    return
-  fi
-
-  local choice
-  while true; do
-    echo -e "${YELLOW}Choose a fetch backend:${RESET}"
-    echo "  1) fastfetch"
-    echo "  2) hyfetch"
-    echo "  3) neofetch"
-    read -rp "Select [1-3, default 1]: " choice
-    choice="${choice:-1}"
-    case "$choice" in
-      1) BACKEND="fastfetch"; break ;;
-      2) BACKEND="hyfetch"; break ;;
-      3) BACKEND="neofetch"; break ;;
-      *) echo -e "${RED}Invalid choice.${RESET}" ;;
-    esac
-  done
+static void fastfetchWorker(AppState &state, double intervalSec, const std::string &backend,
+                             std::vector<std::string> extraArgs) {
+    auto cmd = buildFetchCommand(backend, extraArgs);
+    while (!state.stop.load()) {
+        auto [rc, output] = execCapture(cmd, 10);
+        if (rc == 127 || (rc == -1 && output.empty())) {
+            std::lock_guard<std::mutex> lk(state.mtx);
+            state.fastfetchError = backend + " is not installed or not on PATH.";
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(state.mtx);
+            state.fastfetchLines = splitLines(output);
+            state.fastfetchError.clear();
+        }
+        (void)rc;
+        for (double waited = 0; waited < intervalSec && !state.stop.load(); waited += 0.1)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 }
 
-prime_sudo() {
-  if [ "$USE_ZENITY" -eq 1 ]; then
-    local pass
-    pass="$(zenity --password --title="BeatFetch C++ Installer" --text="Administrator password is needed to install dependencies:")" \
-      || { zerror "Installation cancelled."; exit 1; }
-    if ! printf '%s\n' "$pass" | sudo -S -v 2>/dev/null; then
-      unset pass
-      zerror "Incorrect password."
-      exit 1
-    fi
-    unset pass
-  else
-    sudo -v
-  fi
-
-  ( while true; do sudo -n -v 2>/dev/null; sleep 60; done ) &
-  SUDO_KEEPALIVE_PID=$!
-  trap '[ -n "$SUDO_KEEPALIVE_PID" ] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null; true' EXIT
+static std::string fmtHms(const std::string &s) {
+    std::string t = trim(s);
+    return t.empty() ? "0:00" : t;
 }
 
-fetch_source() {
-  echo -e "${DIM}Fetching BeatFetch source (branch: ${BRANCH})...${RESET}"
-  mkdir -p "$(dirname "$SRC_DIR")"
-  rm -rf "$SRC_DIR"
+static void nowPlayingWorker(AppState &state, double intervalSec, const std::string &player) {
+    const char SEP = '\x01';
+    std::string fmt = std::string("{{status}}") + SEP + "{{playerName}}" + SEP + "{{artist}}" +
+                       SEP + "{{title}}" + SEP + "{{album}}" + SEP + "{{duration(position)}}" +
+                       SEP + "{{duration(mpris:length)}}" + SEP + "{{position}}" + SEP +
+                       "{{mpris:length}}";
+    std::vector<std::string> cmd = {"playerctl"};
+    if (!player.empty()) { cmd.push_back("--player"); cmd.push_back(player); }
+    cmd.push_back("metadata");
+    cmd.push_back("--format");
+    cmd.push_back(fmt);
 
-  if command -v git >/dev/null 2>&1; then
-    git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$SRC_DIR"
-    return
-  fi
-
-  echo -e "${DIM}git not found, downloading a tarball instead...${RESET}"
-  mkdir -p "$SRC_DIR"
-  local tmp_tar
-  tmp_tar="$(mktemp --suffix=.tar.gz)"
-  curl -sL -o "$tmp_tar" "$REPO_TARBALL_BASE/$BRANCH"
-  tar -xzf "$tmp_tar" -C "$SRC_DIR" --strip-components=1
-  rm -f "$tmp_tar"
+    while (!state.stop.load()) {
+        auto [rc, output] = execCapture(cmd, 5);
+        if (rc == 127) {
+            std::lock_guard<std::mutex> lk(state.mtx);
+            state.nowPlaying = NowPlaying{};
+            state.nowPlaying.fatal = "playerctl is not installed or not on PATH.";
+            return;
+        }
+        while (!output.empty() && (output.back() == '\n')) output.pop_back();
+        auto fields = splitChar(output, SEP);
+        {
+            std::lock_guard<std::mutex> lk(state.mtx);
+            if (rc != 0 || fields.size() < 9 || fields[0].empty()) {
+                state.nowPlaying = NowPlaying{};
+            } else {
+                NowPlaying np;
+                np.available = true;
+                np.status = fields[0];
+                np.player = fields[1];
+                np.artist = fields[2];
+                np.title = fields[3];
+                np.album = fields[4];
+                np.posStr = fmtHms(fields[5]);
+                np.lenStr = fmtHms(fields[6]);
+                try {
+                    double p = std::stod(fields[7]);
+                    double l = std::stod(fields[8]);
+                    np.ratio = (l > 0) ? std::max(0.0, std::min(1.0, p / l)) : 0.0;
+                } catch (...) { np.ratio = 0.0; }
+                state.nowPlaying = np;
+            }
+        }
+        for (double waited = 0; waited < intervalSec && !state.stop.load(); waited += 0.1)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 }
 
-install_system_deps() {
-  if command -v apt-get >/dev/null 2>&1; then
-    echo -e "${DIM}Detected apt-get. Installing build tools and runtime dependencies...${RESET}"
-    sudo apt-get update
-    sudo apt-get install -y build-essential curl git
-    case "$BACKEND" in
-      fastfetch)
-        if apt-cache show fastfetch >/dev/null 2>&1; then sudo apt-get install -y fastfetch; else
-          tmp_deb="$(mktemp --suffix=.deb)"
-          curl -sL -o "$tmp_deb" "https://github.com/fastfetch-cli/fastfetch/releases/latest/download/fastfetch-linux-amd64.deb"
-          sudo dpkg -i "$tmp_deb" || sudo apt-get install -f -y
-          rm -f "$tmp_deb"
-        fi
-        ;;
-      hyfetch)
-        sudo apt-get install -y python3-pip python3-rich
-        python3 -m pip install --user --break-system-packages hyfetch prompt-toolkit
-        ;;
-      neofetch)
-        sudo apt-get install -y neofetch
-        ;;
-    esac
-    sudo apt-get install -y playerctl cava
-  elif command -v dnf >/dev/null 2>&1; then
-    echo -e "${DIM}Detected dnf. Installing build tools and runtime dependencies...${RESET}"
-    sudo dnf install -y gcc-c++ make curl git
-    case "$BACKEND" in
-      fastfetch) sudo dnf install -y fastfetch ;;
-      hyfetch)
-        sudo dnf install -y python3-pip python3-rich
-        python3 -m pip install --user --break-system-packages hyfetch prompt-toolkit
-        ;;
-      neofetch) sudo dnf install -y neofetch ;;
-    esac
-    sudo dnf install -y playerctl cava
-  elif command -v pacman >/dev/null 2>&1; then
-    echo -e "${DIM}Detected pacman. Installing build tools and runtime dependencies...${RESET}"
-    sudo pacman -Sy --noconfirm base-devel curl git
-    case "$BACKEND" in
-      fastfetch) sudo pacman -Sy --noconfirm fastfetch ;;
-      hyfetch)
-        sudo pacman -Sy --noconfirm python-pip python-rich
-        python3 -m pip install --user --break-system-packages hyfetch prompt-toolkit
-        ;;
-      neofetch) sudo pacman -Sy --noconfirm neofetch ;;
-    esac
-    sudo pacman -Sy --noconfirm playerctl cava
-  elif command -v zypper >/dev/null 2>&1; then
-    echo -e "${DIM}Detected zypper. Installing build tools and runtime dependencies...${RESET}"
-    sudo zypper install -y gcc-c++ make curl git
-    case "$BACKEND" in
-      fastfetch) sudo zypper install -y fastfetch ;;
-      hyfetch)
-        sudo zypper install -y python3-pip python3-rich
-        python3 -m pip install --user --break-system-packages hyfetch prompt-toolkit
-        ;;
-      neofetch) sudo zypper install -y neofetch ;;
-    esac
-    sudo zypper install -y playerctl cava
-  else
-    zerror "No supported package manager detected."
-    exit 1
-  fi
+static std::string buildCavaConfig(int bars, int maxRange) {
+    std::ostringstream ss;
+    ss << "[general]\n"
+       << "bars = " << bars << "\n"
+       << "framerate = 60\n"
+       << "autosens = 1\n"
+       << "sensitivity = 100\n\n"
+       << "[output]\n"
+       << "method = raw\n"
+       << "raw_target = /dev/stdout\n"
+       << "data_format = ascii\n"
+       << "ascii_max_range = " << maxRange << "\n"
+       << "bar_delimiter = 59\n"
+       << "frame_delimiter = 10\n\n"
+       << "[smoothing]\n"
+       << "monstercat = 1\n"
+       << "noise_reduction = 77\n";
+    return ss.str();
 }
 
-build_and_install() {
-  echo -e "${DIM}Building BeatFetch from source...${RESET}"
-  make -C "$SRC_DIR"
+static void cavaWorker(AppState &state, int bars, int height) {
+    if (!commandExists("cava")) {
+        std::lock_guard<std::mutex> lk(state.mtx);
+        state.cavaError = "cava is not installed or not on PATH.";
+        return;
+    }
+    int maxRange = height * 8;
+    std::string configText = buildCavaConfig(bars, maxRange);
+    char tmpl[] = "/tmp/beatfetch_cava_XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) {
+        std::lock_guard<std::mutex> lk(state.mtx);
+        state.cavaError = "failed to create cava config file.";
+        return;
+    }
+    ssize_t wr = write(fd, configText.c_str(), configText.size());
+    (void)wr;
+    close(fd);
+    std::string configPath = tmpl;
 
-  mkdir -p "$HOME/.local/bin"
-  cat > "$BIN_PATH" <<EOF
-#!/usr/bin/env bash
-exec "$SRC_DIR/beatfetch" --fetch-backend "$BACKEND" "\$@"
-EOF
-  chmod +x "$BIN_PATH"
+    int outPipe[2];
+    if (pipe(outPipe) != 0) {
+        std::lock_guard<std::mutex> lk(state.mtx);
+        state.cavaError = "failed to create pipe for cava.";
+        return;
+    }
+    pid_t pid = fork();
+    if (pid == 0) {
+        dup2(outPipe[1], STDOUT_FILENO);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) dup2(devnull, STDERR_FILENO);
+        close(outPipe[0]); close(outPipe[1]);
+        execlp("cava", "cava", "-p", configPath.c_str(), (char *)nullptr);
+        _exit(127);
+    }
+    close(outPipe[1]);
+    state.cavaPid.store(pid);
 
-  if ! grep -Fq "$PATH_MARKER" "$HOME/.bashrc" 2>/dev/null; then
-    printf '\n%s\n%s\n' "$PATH_MARKER" "$PATH_LINE" >> "$HOME/.bashrc"
-  fi
+    FILE *fp = fdopen(outPipe[0], "r");
+    char buf[8192];
+    if (fp) {
+        while (!state.stop.load() && fgets(buf, sizeof(buf), fp) != nullptr) {
+            std::string l(buf);
+            while (!l.empty() && (l.back() == '\n' || l.back() == ';' || l.back() == '\r'))
+                l.pop_back();
+            if (l.empty()) continue;
+            auto parts = splitChar(l, ';');
+            std::vector<int> values;
+            bool ok = true;
+            for (auto &p : parts) {
+                if (p.empty()) continue;
+                try { values.push_back(std::stoi(p)); }
+                catch (...) { ok = false; break; }
+            }
+            if (ok && !values.empty()) {
+                std::lock_guard<std::mutex> lk(state.mtx);
+                state.bars = values;
+                state.cavaError.clear();
+            }
+        }
+        fclose(fp);
+    }
+    if (!state.stop.load()) {
+        std::lock_guard<std::mutex> lk(state.mtx);
+        state.cavaError = "cava exited unexpectedly. Is an audio server (PulseAudio/PipeWire) running?";
+    }
+    int status;
+    kill(pid, SIGTERM);
+    waitpid(pid, &status, 0);
+    unlink(configPath.c_str());
 }
 
-finish_install_success() {
-  echo
-  echo -e "${GREEN}Installation complete.${RESET}"
-  echo -e "${BOLD}Run:${RESET} beatfetch"
-  echo -e "${DIM}If your shell is already open, run: source ~/.bashrc${RESET}"
-
-  if [ "$USE_ZENITY" -eq 1 ]; then
-    zenity --info --title="BeatFetch C++ Installer" \
-      --text="Installation complete.\n\nOpen a new terminal and run <b>beatfetch</b>, or run:\nsource ~/.bashrc" \
-      --width=360 2>/dev/null || true
-  fi
+static void getTermSize(int &cols, int &rows) {
+    struct winsize w;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0 && w.ws_col > 0) {
+        cols = w.ws_col;
+        rows = w.ws_row;
+    } else {
+        cols = 100;
+        rows = 30;
+    }
 }
 
-# ---------------- uninstall path ----------------
-
-prompt_uninstall_confirm() {
-  if [ "$USE_ZENITY" -eq 1 ]; then
-    zenity --question \
-      --title="BeatFetch C++ Uninstaller" \
-      --text="This will remove the installed BeatFetch command, its source checkout, and shell PATH entries.\n\nContinue?" \
-      --width=360 \
-      || { echo -e "${RED}Uninstall cancelled.${RESET}"; exit 0; }
-    return
-  fi
-
-  echo -e "${YELLOW}This will remove the installed BeatFetch command, its source checkout, and shell PATH entries.${RESET}"
-  local confirm
-  read -rp "Continue? [y/N]: " confirm
-  case "$confirm" in
-    y|Y|yes|YES) return 0 ;;
-    *) echo -e "${RED}Uninstall cancelled.${RESET}"; exit 0 ;;
-  esac
+static void gotoRC(std::string &out, int row, int col) {
+    out += "\033[" + std::to_string(row) + ";" + std::to_string(col) + "H";
 }
 
-remove_binary() {
-  if [ -f "$BIN_PATH" ]; then
-    rm -f "$BIN_PATH"
-    echo -e "${GREEN}Removed user binary: $BIN_PATH${RESET}"
-    log_status "Removed $BIN_PATH"
-  else
-    echo -e "${YELLOW}No user-level beatfetch binary found.${RESET}"
-  fi
+static void drawPanelFrame(std::string &out, int x, int y, int w, int h,
+                           const std::string &title, const std::string &borderColorEsc) {
+    if (w < 4 || h < 3) return;
+    gotoRC(out, y, x);
+    out += borderColorEsc;
+    out += "\u256D";
+    for (int i = 1; i < w - 1; i++) out += "\u2500";
+    out += "\u256E";
+    out += RESET;
+
+    if (!title.empty()) {
+        gotoRC(out, y, x + 2);
+        out += borderColorEsc + " " + title + " " + RESET;
+    }
+
+    for (int row = 1; row < h - 1; row++) {
+        gotoRC(out, y + row, x);
+        out += borderColorEsc + "\u2502" + RESET;
+        gotoRC(out, y + row, x + w - 1);
+        out += borderColorEsc + "\u2502" + RESET;
+    }
+
+    gotoRC(out, y + h - 1, x);
+    out += borderColorEsc + "\u2570";
+    for (int i = 1; i < w - 1; i++) out += "\u2500";
+    out += "\u256F" + RESET;
 }
 
-remove_source() {
-  if [ -d "$SRC_DIR" ]; then
-    rm -rf "$SRC_DIR"
-    echo -e "${GREEN}Removed source checkout: $SRC_DIR${RESET}"
-    log_status "Removed $SRC_DIR"
-  fi
-  # Clean up the parent dir if it's now empty.
-  rmdir "$(dirname "$SRC_DIR")" 2>/dev/null || true
+static void drawContentLine(std::string &out, int x, int y, int w, int h, int contentRow,
+                             const std::string &text, const std::string &borderColorEsc) {
+    int row = y + 1 + contentRow;
+    if (contentRow < 0 || contentRow > h - 3) return;
+    gotoRC(out, row, x + 2);
+    out += text;
+    out += RESET;
+    gotoRC(out, row, x + w - 1);
+    out += borderColorEsc + "\u2502" + RESET;
 }
 
-remove_legacy_leftovers() {
-  # Covers files/dirs left behind by older versions of the installer.
-  if [ -f "$HOME/.local/bin/beatfetch.py" ]; then
-    rm -f "$HOME/.local/bin/beatfetch.py"
-    log_status "Removed $HOME/.local/bin/beatfetch.py"
-  fi
-  for target in "$HOME/.local/share/beatfetch" "$HOME/.local/share/BeatFetch" "$HOME/.cache/beatfetch"; do
-    if [ -d "$target" ]; then
-      rm -rf "$target"
-      echo -e "${GREEN}Removed leftover files in $target${RESET}"
-      log_status "Removed $target"
-    fi
-  done
+static void centerMessage(std::string &out, int x, int y, int w, int h, const std::string &msg,
+                           const std::string &styleEsc, const std::string &borderColorEsc) {
+    int contentH = h - 2;
+    int contentW = w - 4;
+    int row = contentH / 2;
+    int col = std::max(0, ((int)(contentW - (int)msg.size())) / 2);
+    std::string line = styleEsc + msg + RESET;
+    drawContentLine(out, x, y, w, h, row, std::string(col, ' ') + line, borderColorEsc);
 }
 
-clean_shell_path() {
-  if [ -f "$HOME/.bashrc" ] && grep -Fq "$PATH_MARKER" "$HOME/.bashrc"; then
-    cp "$HOME/.bashrc" "$HOME/.bashrc.bak.beatfetch"
-    grep -Fvx "$PATH_MARKER" "$HOME/.bashrc" | grep -Fv "$PATH_LINE" > "$HOME/.bashrc.tmp" || true
-    mv "$HOME/.bashrc.tmp" "$HOME/.bashrc"
-    echo -e "${GREEN}Removed PATH entries from ~/.bashrc${RESET}"
-    log_status "Cleaned PATH entry from ~/.bashrc (backup: ~/.bashrc.bak.beatfetch)"
-  fi
+static void buildFastfetchPanel(std::string &out, AppState &state, int x, int y, int w, int h) {
+    const std::string border = fg(0, 190, 190);
+    drawPanelFrame(out, x, y, w, h, BOLD + fg(0, 200, 200) + "system" + RESET, border);
+    std::vector<std::string> lines;
+    std::string error;
+    {
+        std::lock_guard<std::mutex> lk(state.mtx);
+        lines = state.fastfetchLines;
+        error = state.fastfetchError;
+    }
+    if (lines.empty() && !error.empty()) {
+        centerMessage(out, x, y, w, h, error, BOLD + fg(220, 50, 50), border);
+        return;
+    }
+    if (lines.empty()) {
+        centerMessage(out, x, y, w, h, "Loading fetch info...", DIM + ITALIC, border);
+        return;
+    }
+    int maxRows = h - 2;
+    for (int i = 0; i < (int)lines.size() && i < maxRows; i++)
+        drawContentLine(out, x, y, w, h, i, lines[i], border);
 }
 
-finish_uninstall_success() {
-  echo
-  echo -e "${GREEN}BeatFetch has been uninstalled.${RESET}"
-  echo -e "${DIM}You may need to reopen the terminal or run: source ~/.bashrc${RESET}"
+static void buildNowPlayingPanel(std::string &out, AppState &state, int x, int y, int w, int h) {
+    const std::string border = fg(200, 0, 200);
+    drawPanelFrame(out, x, y, w, h, BOLD + fg(220, 0, 220) + "now playing" + RESET, border);
 
-  if [ "$USE_ZENITY" -eq 1 ]; then
-    local summary
-    if [ "${#STATUS_LOG[@]}" -eq 0 ]; then
-      summary="No BeatFetch files were found — nothing to remove."
-    else
-      summary="$(printf '%s\n' "${STATUS_LOG[@]}")"
-    fi
-    zenity --info --title="BeatFetch C++ Uninstaller" \
-      --text="BeatFetch has been uninstalled.
+    NowPlaying np;
+    {
+        std::lock_guard<std::mutex> lk(state.mtx);
+        np = state.nowPlaying;
+    }
+    if (!np.fatal.empty()) {
+        centerMessage(out, x, y, w, h, np.fatal, BOLD + fg(220, 50, 50), border);
+        return;
+    }
+    if (!np.available) {
+        centerMessage(out, x, y, w, h, "\u266A  nothing playing  \u266A", DIM + ITALIC, border);
+        return;
+    }
 
-${summary}
+    int row = 0;
+    std::string header = BOLD + fg(0, 220, 100) + std::string(STATUS_ICON(np.status)) + " " +
+                          RESET + fg(120, 120, 120) + BOLD + np.player + RESET;
+    drawContentLine(out, x, y, w, h, row++, header, border);
+    row++;
+    drawContentLine(out, x, y, w, h, row++, BOLD + fg(255, 255, 255) + np.title + RESET, border);
+    drawContentLine(out, x, y, w, h, row++, ITALIC + fg(0, 200, 200) + np.artist + RESET, border);
+    if (!np.album.empty())
+        drawContentLine(out, x, y, w, h, row++, DIM + np.album + RESET, border);
+    row++;
 
-Open a new terminal, or run: source ~/.bashrc" \
-      --width=400 2>/dev/null || true
-  fi
+    int barWidth = std::max(4, w - 6);
+    int filled = (int)(np.ratio * barWidth);
+    std::string barStr = fg(200, 0, 200);
+    for (int i = 0; i < filled; i++) barStr += "\u2588";
+    barStr += fg(90, 90, 90);
+    for (int i = 0; i < barWidth - filled; i++) barStr += "\u2591";
+    barStr += RESET;
+    drawContentLine(out, x, y, w, h, row++, barStr, border);
+    drawContentLine(out, x, y, w, h, row++, DIM + np.posStr + " / " + np.lenStr + RESET, border);
 }
 
-# ---------------- shared helpers ----------------
+static void buildVisualizerPanel(std::string &out, AppState &state, int x, int y, int w, int h) {
+    const std::string border = fg(220, 0, 220);
+    drawPanelFrame(out, x, y, w, h, BOLD + fg(230, 0, 230) + "visualizer" + RESET, border);
 
-# Runs a step function; if zenity is active, shows a pulsating progress
-# dialog while it runs. Output is always still tee'd to the terminal
-# and to LOG_FILE, and the dialog is torn down once the step finishes.
-with_progress_dialog() {
-  local text="$1" fn="$2" zpid="" status
+    std::vector<int> values;
+    std::string error;
+    {
+        std::lock_guard<std::mutex> lk(state.mtx);
+        values = state.bars;
+        error = state.cavaError;
+    }
+    if (values.empty() && !error.empty()) {
+        centerMessage(out, x, y, w, h, error, BOLD + fg(220, 50, 50), border);
+        return;
+    }
+    if (values.empty()) {
+        centerMessage(out, x, y, w, h, "Waiting for audio...", DIM + ITALIC, border);
+        return;
+    }
 
-  if [ "$USE_ZENITY" -eq 1 ]; then
-    zenity --progress --title="BeatFetch C++ Installer" --text="$text" \
-      --pulsate --no-cancel --auto-close 2>/dev/null &
-    zpid=$!
-  fi
-
-  set +e
-  "$fn" 2>&1 | tee -a "$LOG_FILE"
-  status=${PIPESTATUS[0]}
-  set -e
-
-  if [ -n "$zpid" ]; then
-    kill "$zpid" 2>/dev/null || true
-    wait "$zpid" 2>/dev/null || true
-  fi
-
-  if [ "$status" -ne 0 ]; then
-    zerror "Step failed: $text (see $LOG_FILE for details)"
-    exit "$status"
-  fi
+    int contentH = h - 2;
+    int contentW = w - 4;
+    int maxRange = contentH * 8;
+    static const char *BLOCKS[9] = {" ", "\u2581", "\u2582", "\u2583", "\u2584",
+                                    "\u2585", "\u2586", "\u2587", "\u2588"};
+    int n = std::min((int)values.size(), contentW);
+    for (int rowFromTop = 0; rowFromTop < contentH; rowFromTop++) {
+        int rowFromBottom = contentH - 1 - rowFromTop;
+        int thresholdMin = rowFromBottom * 8;
+        int gradIdx = std::min(rowFromBottom, 7);
+        std::string rowStr = fg(VU_GRADIENT[gradIdx][0], VU_GRADIENT[gradIdx][1],
+                                 VU_GRADIENT[gradIdx][2]);
+        for (int i = 0; i < n; i++) {
+            int v = std::max(0, std::min(maxRange, values[i]));
+            int fill = v - thresholdMin;
+            if (fill >= 8) rowStr += BLOCKS[8];
+            else if (fill <= 0) rowStr += " ";
+            else rowStr += BLOCKS[fill];
+        }
+        rowStr += RESET;
+        drawContentLine(out, x, y, w, h, rowFromTop, rowStr, border);
+    }
 }
 
-run_install() {
-  choose_backend
-  prime_sudo
-  with_progress_dialog "Installing system dependencies..." install_system_deps
-  with_progress_dialog "Fetching BeatFetch source..." fetch_source
-  with_progress_dialog "Building BeatFetch..." build_and_install
-  finish_install_success
+static std::atomic<bool> g_stop{false};
+static std::atomic<bool> g_resizePending{false};
+static AppState *g_state = nullptr;
+
+static void handleSignal(int sig) {
+    if (sig == SIGWINCH) {
+        g_resizePending.store(true);
+        return;
+    }
+    g_stop.store(true);
+    if (g_state) {
+        g_state->stop.store(true);
+        pid_t p = g_state->cavaPid.load();
+        if (p > 0) kill(p, SIGTERM);
+    }
 }
 
-run_uninstall() {
-  prompt_uninstall_confirm
-  remove_binary
-  remove_source
-  remove_legacy_leftovers
-  clean_shell_path
-  finish_uninstall_success
+static void printUsage(const char *prog) {
+    printf("Usage: %s [options]\n"
+           "  --fetch-backend <fastfetch|hyfetch|neofetch>  (default fastfetch)\n"
+           "  --fastfetch-interval <seconds>   (default 3.0)\n"
+           "  --player-interval <seconds>      (default 1.0)\n"
+           "  --fps <n>                        (default 20)\n"
+           "  --bars <n>                       (default 106)\n"
+           "  --player <name>                  restrict playerctl to a player\n"
+           "  --fastfetch-args \"<args>\"         extra args passed to the backend\n"
+           "  -h, --help\n",
+           prog);
 }
 
-parse_args "$@"
-ui_banner
-setup_mode
-case "$ACTION" in
-  install) run_install ;;
-  uninstall) run_uninstall ;;
-esac
+int main(int argc, char **argv) {
+    std::string backend = "fastfetch";
+    double fastfetchInterval = 3.0;
+    double playerInterval = 1.0;
+    double fps = 20.0;
+    int bars = 106;
+    int visHeightCfg = 8;
+    std::string player;
+    std::string fastfetchArgsRaw;
+
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        auto next = [&](const char *name) -> std::string {
+            if (i + 1 >= argc) { fprintf(stderr, "%s requires a value\n", name); exit(1); }
+            return argv[++i];
+        };
+        if (a == "--fetch-backend") backend = next("--fetch-backend");
+        else if (a == "--fastfetch-interval") fastfetchInterval = std::stod(next("--fastfetch-interval"));
+        else if (a == "--player-interval") playerInterval = std::stod(next("--player-interval"));
+        else if (a == "--fps") fps = std::stod(next("--fps"));
+        else if (a == "--bars") bars = std::stoi(next("--bars"));
+        else if (a == "--vis-height") visHeightCfg = std::stoi(next("--vis-height"));
+        else if (a == "--player") player = next("--player");
+        else if (a == "--fastfetch-args") fastfetchArgsRaw = next("--fastfetch-args");
+        else if (a == "-h" || a == "--help") { printUsage(argv[0]); return 0; }
+        else { fprintf(stderr, "Unknown option: %s\n", a.c_str()); printUsage(argv[0]); return 1; }
+    }
+
+    if (const char *envBackend = getenv("BEATFETCH_FETCH_BACKEND")) {
+        if (backend == "fastfetch") backend = envBackend;
+    }
+
+    if (backend != "fastfetch" && backend != "hyfetch" && backend != "neofetch") {
+        fprintf(stderr, "Error: unsupported fetch backend '%s'.\n", backend.c_str());
+        return 1;
+    }
+    if (!backendAvailable(backend)) {
+        fprintf(stderr, "Error: '%s' was not found on PATH.\n", backend.c_str());
+        return 1;
+    }
+    if (!commandExists("playerctl"))
+        fprintf(stderr, "Warning: 'playerctl' not found - now-playing panel disabled.\n");
+    if (!commandExists("cava"))
+        fprintf(stderr, "Warning: 'cava' not found - visualizer panel disabled.\n");
+
+    std::vector<std::string> extraArgs;
+    if (!fastfetchArgsRaw.empty()) {
+        std::istringstream iss(fastfetchArgsRaw);
+        std::string tok;
+        while (iss >> tok) extraArgs.push_back(tok);
+    }
+
+    AppState state;
+    g_state = &state;
+    signal(SIGINT, handleSignal);
+    signal(SIGTERM, handleSignal);
+    signal(SIGWINCH, handleSignal);
+
+    std::thread tFastfetch(fastfetchWorker, std::ref(state), fastfetchInterval, backend, extraArgs);
+    std::thread tPlayer(nowPlayingWorker, std::ref(state), playerInterval, player);
+    std::thread tCava(cavaWorker, std::ref(state), bars, visHeightCfg);
+
+    printf("\033[?1049h\033[?25l\033[?7l");
+    fflush(stdout);
+
+    auto frameDelay = std::chrono::milliseconds((long)(1000.0 / std::max(1.0, fps)));
+    while (!g_stop.load()) {
+        int cols, rows;
+        getTermSize(cols, rows);
+
+        std::string frame;
+        frame += "\033[2J\033[H";
+
+        if (cols >= 100) {
+            int leftW = std::max(30, (cols * 3) / 5);
+            int rightX = leftW + 1;
+            int rightW = cols - rightX + 1;
+            if (rightW < 24) rightW = 24;
+            if (rightX > cols) rightX = cols;
+
+            int nowPlayingH = std::min(12, std::max(6, rows - 4));
+            int visY = 1 + nowPlayingH;
+            int visH = rows - nowPlayingH;
+            if (visH < 4) visH = 4;
+
+            buildFastfetchPanel(frame, state, 1, 1, leftW, rows);
+            buildNowPlayingPanel(frame, state, rightX, 1, rightW, nowPlayingH);
+            buildVisualizerPanel(frame, state, rightX, visY, rightW, visH);
+        } else {
+            int systemH = std::max(8, rows / 3);
+            int nowPlayingH = std::max(6, (rows - systemH) / 2);
+            int visH = rows - systemH - nowPlayingH;
+            if (visH < 4) {
+                visH = 4;
+                nowPlayingH = std::max(6, rows - systemH - visH);
+            }
+            if (nowPlayingH < 4) nowPlayingH = 4;
+            buildFastfetchPanel(frame, state, 1, 1, cols, systemH);
+            buildNowPlayingPanel(frame, state, 1, 1 + systemH, cols, nowPlayingH);
+            buildVisualizerPanel(frame, state, 1, 1 + systemH + nowPlayingH, cols, visH);
+        }
+
+        ssize_t wr = write(STDOUT_FILENO, frame.data(), frame.size());
+        (void)wr;
+
+        g_resizePending.store(false);
+        std::this_thread::sleep_for(frameDelay);
+    }
+
+    printf("\033[?7h\033[?25h\033[?1049l");
+    fflush(stdout);
+
+    state.stop.store(true);
+    {
+        pid_t p = state.cavaPid.load();
+        if (p > 0) kill(p, SIGTERM);
+    }
+    tFastfetch.join();
+    tPlayer.join();
+    tCava.join();
+    return 0;
+}
