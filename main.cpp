@@ -9,10 +9,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <clocale>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <fcntl.h>
 #include <mutex>
 #include <sstream>
@@ -389,13 +391,55 @@ static void drawPanelFrame(std::string &out, int x, int y, int w, int h,
     out += "\u256F" + RESET;
 }
 
+static std::string clipTerminalText(const std::string &text, int maxColumns) {
+    std::string clipped;
+    std::mbstate_t state{};
+    int columns = 0;
+    for (size_t i = 0; i < text.size() && columns < maxColumns;) {
+        unsigned char ch = static_cast<unsigned char>(text[i]);
+        if (ch == 0x1b && i + 1 < text.size() && text[i + 1] == '[') {
+            size_t end = i + 2;
+            while (end < text.size() && !(text[end] >= 0x40 && text[end] <= 0x7e)) end++;
+            if (end < text.size()) {
+                if (text[end] == 'm') clipped.append(text, i, end - i + 1);
+                i = end + 1;
+                continue;
+            }
+        }
+        if (ch < 0x20 || ch == 0x7f) {
+            if (ch == '\t') {
+                clipped.push_back(' ');
+                columns++;
+            }
+            i++;
+            continue;
+        }
+
+        wchar_t wide;
+        size_t length = std::mbrtowc(&wide, text.data() + i, text.size() - i, &state);
+        int width = 1;
+        if (length == static_cast<size_t>(-1) || length == static_cast<size_t>(-2) || length == 0) {
+            state = std::mbstate_t{};
+            length = 1;
+        } else {
+            width = std::max(0, ::wcwidth(wide));
+        }
+        if (columns + width > maxColumns) break;
+        clipped.append(text, i, length);
+        columns += width;
+        i += length;
+    }
+    return clipped;
+}
+
 static void drawContentLine(std::string &out, int x, int y, int w, int h, int contentRow,
                              const std::string &text, const std::string &borderColorEsc) {
     int row = y + 1 + contentRow;
     if (contentRow < 0 || contentRow > h - 3) return;
     gotoRC(out, row, x + 2);
-    out += text;
+    out += clipTerminalText(text, std::max(0, w - 4));
     out += RESET;
+    out += "\033[K";
     gotoRC(out, row, x + w - 1);
     out += borderColorEsc + "\u2502" + RESET;
 }
@@ -548,6 +592,7 @@ static void printUsage(const char *prog) {
 }
 
 int main(int argc, char **argv) {
+    setlocale(LC_CTYPE, "");
     std::string backend = "fastfetch";
     double fastfetchInterval = 3.0;
     double playerInterval = 1.0;
