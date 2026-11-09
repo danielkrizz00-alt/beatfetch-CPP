@@ -1,37 +1,33 @@
-# BeatFetch (C++)
+# BeatFetch C++
 
-A live terminal dashboard, ported from the original Python/rich prototype to a compact C++ implementation.
-
+BeatFetch is a Linux terminal dashboard that combines fetch system information,
+MPRIS now-playing details, and a live audio spectrum from Cava.
 
 ## Requirements
 
-- C++17 compiler and make
-- fastfetch, hyfetch, or neofetch
-- playerctl
-- cava
+- C++17 compiler and `make`
+- One fetch backend: `fastfetch`, `hyfetch`, or `neofetch`
+- `playerctl` and `cava` (optional dashboard panels)
 
 ## Install
 
-```bash
-chmod +x install.sh
-./install.sh
-```
-
-## Run
+From this directory, run:
 
 ```bash
-beatfetch
+./install-cpp-beatfetch.sh
 ```
+
+The installer installs the executable under `~/.local/lib/beatfetch` and the
+launcher under `~/.local/bin`. If needed, add `~/.local/bin` to your `PATH` or
+reload `~/.bashrc`.
 
 ## Build manually
 
 ```bash
-make
-./beatfetch
+make -C Beatfetch_C/beatfetch-cpp-latest
+Beatfetch_C/beatfetch-cpp-latest/beatfetch --help
 ```
 
-## Options
-
-```bash
-beatfetch --help
-```
+Use `./uninstall-beatfetch.sh` to remove the installed executable, launcher,
+and PATH block added by the installer. It does not remove source files or
+system packages.
