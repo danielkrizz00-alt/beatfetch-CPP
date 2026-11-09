@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_DIR="$SCRIPT_DIR/Beatfetch_C/beatfetch-cpp-latest"
+INSTALL_DIR="$HOME/.local/lib/beatfetch"
 
 BOLD='\033[1m'
 DIM='\033[2m'
@@ -12,33 +13,6 @@ YELLOW='\033[33m'
 RED='\033[31m'
 RESET='\033[0m'
 
-USE_ZENITY=0
-FORCE_MODE=""
-LOG_FILE="$(mktemp /tmp/beatfetch-install.XXXXXX.log)"
-SUDO_KEEPALIVE_PID=""
-
-usage() {
-  cat <<EOF
-Usage: $(basename "$0") [--gui|--no-gui] [-h|--help]
-
-  --gui      Force the zenity-based graphical installer (requires a display).
-  --no-gui   Force the plain terminal installer, even in a graphical session.
-  -h, --help Show this help text.
-EOF
-}
-
-parse_args() {
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --gui) FORCE_MODE="gui" ;;
-      --no-gui|--cli) FORCE_MODE="cli" ;;
-      -h|--help) usage; exit 0 ;;
-      *) echo -e "${RED}Unknown option: $1${RESET}"; usage; exit 1 ;;
-    esac
-    shift
-  done
-}
-
 ui_banner() {
   clear
   echo -e "${BOLD}${CYAN}========================================${RESET}"
@@ -47,84 +21,7 @@ ui_banner() {
   echo
 }
 
-has_display() {
-  [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]
-}
-
-ensure_zenity() {
-  # Only bother trying if we're actually in a graphical session.
-  has_display || return 1
-
-  if command -v zenity >/dev/null 2>&1; then
-    return 0
-  fi
-
-  echo -e "${DIM}Graphical session detected but zenity isn't installed. Installing it...${RESET}"
-  if command -v apt-get >/dev/null 2>&1; then
-    sudo apt-get update && sudo apt-get install -y zenity
-  elif command -v dnf >/dev/null 2>&1; then
-    sudo dnf install -y zenity
-  elif command -v pacman >/dev/null 2>&1; then
-    sudo pacman -Sy --noconfirm zenity
-  elif command -v zypper >/dev/null 2>&1; then
-    sudo zypper install -y zenity
-  fi
-
-  command -v zenity >/dev/null 2>&1
-}
-
-setup_mode() {
-  case "$FORCE_MODE" in
-    gui)
-      if ensure_zenity; then
-        USE_ZENITY=1
-      else
-        echo -e "${YELLOW}zenity isn't available (no display, or install failed); falling back to terminal prompts.${RESET}"
-        USE_ZENITY=0
-      fi
-      ;;
-    cli)
-      USE_ZENITY=0
-      ;;
-    *)
-      if ensure_zenity; then
-        USE_ZENITY=1
-        echo -e "${DIM}Graphical session detected — using zenity dialogs. Pass --no-gui to use the terminal instead.${RESET}"
-      else
-        USE_ZENITY=0
-      fi
-      ;;
-  esac
-}
-
-zerror() {
-  echo -e "${RED}$1${RESET}" >&2
-  if [ "$USE_ZENITY" -eq 1 ]; then
-    zenity --error --title="BeatFetch C++ Installer" --text="$1" --width=360 2>/dev/null || true
-  fi
-}
-
 choose_backend() {
-  if [ "$USE_ZENITY" -eq 1 ]; then
-    local selection
-    selection="$(zenity --list \
-      --title="BeatFetch C++ Installer" \
-      --text="Choose a fetch backend:" \
-      --radiolist --hide-header \
-      --column="Pick" --column="Backend" \
-      TRUE  fastfetch \
-      FALSE hyfetch \
-      FALSE neofetch \
-      --width=360 --height=260)" || { zerror "Installation cancelled."; exit 1; }
-
-    case "$selection" in
-      fastfetch|hyfetch|neofetch) BACKEND="$selection" ;;
-      *) zerror "No backend selected."; exit 1 ;;
-    esac
-    echo -e "${DIM}Backend selected: ${BACKEND}${RESET}"
-    return
-  fi
-
   local choice
   while true; do
     echo -e "${YELLOW}Choose a fetch backend:${RESET}"
@@ -140,28 +37,6 @@ choose_backend() {
       *) echo -e "${RED}Invalid choice.${RESET}" ;;
     esac
   done
-}
-
-prime_sudo() {
-  if [ "$USE_ZENITY" -eq 1 ]; then
-    local pass
-    pass="$(zenity --password --title="BeatFetch C++ Installer" --text="Administrator password is needed to install dependencies:")" \
-      || { zerror "Installation cancelled."; exit 1; }
-    if ! printf '%s\n' "$pass" | sudo -S -v 2>/dev/null; then
-      unset pass
-      zerror "Incorrect password."
-      exit 1
-    fi
-    unset pass
-  else
-    sudo -v
-  fi
-
-  # Keep the sudo timestamp alive in the background so later steps
-  # (running under a progress dialog) don't need to prompt again.
-  ( while true; do sudo -n -v 2>/dev/null; sleep 60; done ) &
-  SUDO_KEEPALIVE_PID=$!
-  trap '[ -n "$SUDO_KEEPALIVE_PID" ] && kill "$SUDO_KEEPALIVE_PID" 2>/dev/null; true' EXIT
 }
 
 install_system_deps() {
@@ -224,7 +99,7 @@ install_system_deps() {
     esac
     sudo zypper install -y playerctl cava
   else
-    zerror "No supported package manager detected."
+    echo -e "${RED}No supported package manager detected.${RESET}"
     exit 1
   fi
 }
@@ -232,65 +107,26 @@ install_system_deps() {
 build_and_install() {
   echo -e "${DIM}Building the latest C++ BeatFetch source...${RESET}"
   make -C "$APP_DIR"
+  install -Dm755 "$APP_DIR/beatfetch" "$INSTALL_DIR/beatfetch"
   mkdir -p "$HOME/.local/bin"
   cat > "$HOME/.local/bin/beatfetch" <<EOF
 #!/usr/bin/env bash
-exec "$APP_DIR/beatfetch" --fetch-backend "$BACKEND" "\$@"
+exec "$INSTALL_DIR/beatfetch" --fetch-backend "$BACKEND" "\$@"
 EOF
   chmod +x "$HOME/.local/bin/beatfetch"
 
   PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
   if ! grep -Fq "$PATH_LINE" "$HOME/.bashrc" 2>/dev/null; then
-    printf '\n# Added by BeatFetch C++ installer\n%s\n' "$PATH_LINE" >> "$HOME/.bashrc"
+    printf '\n# >>> BeatFetch C++ installer >>>\n%s\n# <<< BeatFetch C++ installer <<<\n' "$PATH_LINE" >> "$HOME/.bashrc"
   fi
 }
 
-# Runs a step function; if zenity is active, shows a pulsating progress
-# dialog while it runs. Output is always still tee'd to the terminal
-# and to LOG_FILE, and the dialog is torn down once the step finishes.
-with_progress_dialog() {
-  local text="$1" fn="$2" zpid="" status
-
-  if [ "$USE_ZENITY" -eq 1 ]; then
-    zenity --progress --title="BeatFetch C++ Installer" --text="$text" \
-      --pulsate --no-cancel --auto-close 2>/dev/null &
-    zpid=$!
-  fi
-
-  set +e
-  "$fn" 2>&1 | tee -a "$LOG_FILE"
-  status=${PIPESTATUS[0]}
-  set -e
-
-  if [ -n "$zpid" ]; then
-    kill "$zpid" 2>/dev/null || true
-    wait "$zpid" 2>/dev/null || true
-  fi
-
-  if [ "$status" -ne 0 ]; then
-    zerror "Step failed: $text (see $LOG_FILE for details)"
-    exit "$status"
-  fi
-}
-
-finish_success() {
-  echo
-  echo -e "${GREEN}Installation complete.${RESET}"
-  echo -e "${BOLD}Run:${RESET} beatfetch"
-  echo -e "${DIM}If your shell is already open, run: source ~/.bashrc${RESET}"
-
-  if [ "$USE_ZENITY" -eq 1 ]; then
-    zenity --info --title="BeatFetch C++ Installer" \
-      --text="Installation complete.\n\nOpen a new terminal and run <b>beatfetch</b>, or run:\nsource ~/.bashrc" \
-      --width=360 2>/dev/null || true
-  fi
-}
-
-parse_args "$@"
 ui_banner
-setup_mode
 choose_backend
-prime_sudo
-with_progress_dialog "Installing system dependencies..." install_system_deps
-with_progress_dialog "Building BeatFetch..." build_and_install
-finish_success
+install_system_deps
+build_and_install
+
+echo
+echo -e "${GREEN}Installation complete.${RESET}"
+echo -e "${BOLD}Run:${RESET} beatfetch"
+echo -e "${DIM}If your shell is already open, run: source ~/.bashrc${RESET}"
