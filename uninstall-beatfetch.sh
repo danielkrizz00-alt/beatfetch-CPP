@@ -1,173 +1,132 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_DIR="$SCRIPT_DIR/Beatfetch_C/beatfetch-cpp-latest"
+INSTALL_DIR="$HOME/.local/lib/beatfetch"
+
 BOLD='\033[1m'
 DIM='\033[2m'
-CYAN='\033[36m'
 GREEN='\033[32m'
-RED='\033[31m'
+CYAN='\033[36m'
 YELLOW='\033[33m'
+RED='\033[31m'
 RESET='\033[0m'
-
-USE_ZENITY=0
-FORCE_MODE=""
-STATUS_LOG=()
-
-usage() {
-  cat <<EOF
-Usage: $(basename "$0") [--gui|--no-gui] [-h|--help]
-
-  --gui      Use zenity dialogs (requires zenity to already be installed).
-  --no-gui   Use plain terminal prompts, even in a graphical session.
-  -h, --help Show this help text.
-EOF
-}
-
-parse_args() {
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --gui) FORCE_MODE="gui" ;;
-      --no-gui|--cli) FORCE_MODE="cli" ;;
-      -h|--help) usage; exit 0 ;;
-      *) echo -e "${RED}Unknown option: $1${RESET}"; usage; exit 1 ;;
-    esac
-    shift
-  done
-}
 
 ui_banner() {
   clear
   echo -e "${BOLD}${CYAN}========================================${RESET}"
-  echo -e "${BOLD}       BeatFetch Uninstaller         ${RESET}"
+  echo -e "${BOLD}       BeatFetch C++ Installer         ${RESET}"
   echo -e "${BOLD}${CYAN}========================================${RESET}"
   echo
 }
 
-has_display() {
-  [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]
-}
-
-# Unlike the installer, we deliberately do NOT offer to install zenity here:
-# uninstalling shouldn't need sudo or a package install of its own. If it's
-# not already present, we just use the terminal prompts.
-setup_mode() {
-  case "$FORCE_MODE" in
-    gui)
-      if command -v zenity >/dev/null 2>&1; then
-        USE_ZENITY=1
-      else
-        echo -e "${YELLOW}zenity isn't installed; falling back to terminal prompts.${RESET}"
-        USE_ZENITY=0
-      fi
-      ;;
-    cli)
-      USE_ZENITY=0
-      ;;
-    *)
-      if has_display && command -v zenity >/dev/null 2>&1; then
-        USE_ZENITY=1
-        echo -e "${DIM}Graphical session detected — using zenity dialogs. Pass --no-gui to use the terminal instead.${RESET}"
-      else
-        USE_ZENITY=0
-      fi
-      ;;
-  esac
-}
-
-log_status() {
-  STATUS_LOG+=("$1")
-}
-
-remove_binary() {
-  if [ -f "$HOME/.local/bin/beatfetch" ]; then
-    rm -f "$HOME/.local/bin/beatfetch"
-    echo -e "${GREEN}Removed user binary: $HOME/.local/bin/beatfetch${RESET}"
-    log_status "Removed $HOME/.local/bin/beatfetch"
-  else
-    echo -e "${YELLOW}No user-level beatfetch binary found.${RESET}"
-  fi
-}
-
-remove_python_wrapper() {
-  if [ -f "$HOME/.local/bin/beatfetch.py" ]; then
-    rm -f "$HOME/.local/bin/beatfetch.py"
-    log_status "Removed $HOME/.local/bin/beatfetch.py"
-  fi
-}
-
-remove_repo_stubs() {
-  for target in "$HOME/.local/share/beatfetch" "$HOME/.local/share/BeatFetch" "$HOME/.cache/beatfetch"; do
-    if [ -d "$target" ]; then
-      rm -rf "$target"
-      echo -e "${GREEN}Removed leftover files in $target${RESET}"
-      log_status "Removed $target"
-    fi
+choose_backend() {
+  local choice
+  while true; do
+    echo -e "${YELLOW}Choose a fetch backend:${RESET}"
+    echo "  1) fastfetch"
+    echo "  2) hyfetch"
+    echo "  3) neofetch"
+    read -rp "Select [1-3, default 1]: " choice
+    choice="${choice:-1}"
+    case "$choice" in
+      1) BACKEND="fastfetch"; break ;;
+      2) BACKEND="hyfetch"; break ;;
+      3) BACKEND="neofetch"; break ;;
+      *) echo -e "${RED}Invalid choice.${RESET}" ;;
+    esac
   done
 }
 
-clean_shell_path() {
-  # Must match the marker install-cpp-beatfetch.sh actually writes.
-  local marker="# Added by BeatFetch C++ installer"
-  if [ -f "$HOME/.bashrc" ]; then
-    if grep -Fq "$marker" "$HOME/.bashrc"; then
-      cp "$HOME/.bashrc" "$HOME/.bashrc.bak.beatfetch"
-      grep -Fvx "$marker" "$HOME/.bashrc" > "$HOME/.bashrc.tmp" || true
-      grep -Fv 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.bashrc.tmp" > "$HOME/.bashrc.clean" || true
-      mv "$HOME/.bashrc.clean" "$HOME/.bashrc"
-      rm -f "$HOME/.bashrc.tmp"
-      echo -e "${GREEN}Removed PATH entries from ~/.bashrc${RESET}"
-      log_status "Cleaned PATH entry from ~/.bashrc (backup: ~/.bashrc.bak.beatfetch)"
-    fi
+install_system_deps() {
+  if command -v apt-get >/dev/null 2>&1; then
+    echo -e "${DIM}Detected apt-get. Installing build tools and runtime dependencies...${RESET}"
+    sudo apt-get update
+    sudo apt-get install -y build-essential curl git
+    case "$BACKEND" in
+      fastfetch)
+        if apt-cache show fastfetch >/dev/null 2>&1; then sudo apt-get install -y fastfetch; else
+          tmp_deb="$(mktemp --suffix=.deb)"
+          curl -sL -o "$tmp_deb" "https://github.com/fastfetch-cli/fastfetch/releases/latest/download/fastfetch-linux-amd64.deb"
+          sudo dpkg -i "$tmp_deb" || sudo apt-get install -f -y
+          rm -f "$tmp_deb"
+        fi
+        ;;
+      hyfetch)
+        sudo apt-get install -y python3-pip python3-rich
+        python3 -m pip install --user --break-system-packages hyfetch prompt-toolkit
+        ;;
+      neofetch)
+        sudo apt-get install -y neofetch
+        ;;
+    esac
+    sudo apt-get install -y playerctl cava
+  elif command -v dnf >/dev/null 2>&1; then
+    echo -e "${DIM}Detected dnf. Installing build tools and runtime dependencies...${RESET}"
+    sudo dnf install -y gcc-c++ make curl git
+    case "$BACKEND" in
+      fastfetch) sudo dnf install -y fastfetch ;;
+      hyfetch)
+        sudo dnf install -y python3-pip python3-rich
+        python3 -m pip install --user --break-system-packages hyfetch prompt-toolkit
+        ;;
+      neofetch) sudo dnf install -y neofetch ;;
+    esac
+    sudo dnf install -y playerctl cava
+  elif command -v pacman >/dev/null 2>&1; then
+    echo -e "${DIM}Detected pacman. Installing build tools and runtime dependencies...${RESET}"
+    sudo pacman -Sy --noconfirm base-devel curl git
+    case "$BACKEND" in
+      fastfetch) sudo pacman -Sy --noconfirm fastfetch ;;
+      hyfetch)
+        sudo pacman -Sy --noconfirm python-pip python-rich
+        python3 -m pip install --user --break-system-packages hyfetch prompt-toolkit
+        ;;
+      neofetch) sudo pacman -Sy --noconfirm neofetch ;;
+    esac
+    sudo pacman -Sy --noconfirm playerctl cava
+  elif command -v zypper >/dev/null 2>&1; then
+    echo -e "${DIM}Detected zypper. Installing build tools and runtime dependencies...${RESET}"
+    sudo zypper install -y gcc-c++ make curl git
+    case "$BACKEND" in
+      fastfetch) sudo zypper install -y fastfetch ;;
+      hyfetch)
+        sudo zypper install -y python3-pip python3-rich
+        python3 -m pip install --user --break-system-packages hyfetch prompt-toolkit
+        ;;
+      neofetch) sudo zypper install -y neofetch ;;
+    esac
+    sudo zypper install -y playerctl cava
+  else
+    echo -e "${RED}No supported package manager detected.${RESET}"
+    exit 1
   fi
 }
 
-prompt_confirm() {
-  if [ "$USE_ZENITY" -eq 1 ]; then
-    zenity --question \
-      --title="BeatFetch Uninstaller" \
-      --text="This will remove the installed BeatFetch command and shell PATH entries.\n\nContinue?" \
-      --width=360 \
-      || { echo -e "${RED}Uninstall cancelled.${RESET}"; exit 0; }
-    return
-  fi
+build_and_install() {
+  echo -e "${DIM}Building the latest C++ BeatFetch source...${RESET}"
+  make -C "$APP_DIR"
+  install -Dm755 "$APP_DIR/beatfetch" "$INSTALL_DIR/beatfetch"
+  mkdir -p "$HOME/.local/bin"
+  cat > "$HOME/.local/bin/beatfetch" <<EOF
+#!/usr/bin/env bash
+exec "$INSTALL_DIR/beatfetch" --fetch-backend "$BACKEND" "\$@"
+EOF
+  chmod +x "$HOME/.local/bin/beatfetch"
 
-  echo -e "${YELLOW}This will remove the installed BeatFetch command and shell PATH entries.${RESET}"
-  local confirm
-  read -rp "Continue? [y/N]: " confirm
-  case "$confirm" in
-    y|Y|yes|YES) return 0 ;;
-    *) echo -e "${RED}Uninstall cancelled.${RESET}"; exit 0 ;;
-  esac
-}
-
-finish_success() {
-  echo
-  echo -e "${GREEN}BeatFetch has been uninstalled.${RESET}"
-  echo -e "${DIM}You may need to reopen the terminal or run: source ~/.bashrc${RESET}"
-
-  if [ "$USE_ZENITY" -eq 1 ]; then
-    local summary
-    if [ "${#STATUS_LOG[@]}" -eq 0 ]; then
-      summary="No BeatFetch files were found — nothing to remove."
-    else
-      summary="$(printf '%s\n' "${STATUS_LOG[@]}")"
-    fi
-    zenity --info --title="BeatFetch Uninstaller" \
-      --text="BeatFetch has been uninstalled.
-
-${summary}
-
-Open a new terminal, or run: source ~/.bashrc" \
-      --width=400 2>/dev/null || true
+  PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
+  if ! grep -Fq "$PATH_LINE" "$HOME/.bashrc" 2>/dev/null; then
+    printf '\n# >>> BeatFetch C++ installer >>>\n%s\n# <<< BeatFetch C++ installer <<<\n' "$PATH_LINE" >> "$HOME/.bashrc"
   fi
 }
 
-parse_args "$@"
 ui_banner
-setup_mode
-prompt_confirm
-remove_binary
-remove_python_wrapper
-remove_repo_stubs
-clean_shell_path
-finish_success
+choose_backend
+install_system_deps
+build_and_install
+
+echo
+echo -e "${GREEN}Installation complete.${RESET}"
+echo -e "${BOLD}Run:${RESET} beatfetch"
+echo -e "${DIM}If your shell is already open, run: source ~/.bashrc${RESET}"
